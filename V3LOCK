@@ -178,6 +178,7 @@ contract V3LOCK {
         require(block.timestamp >= lock.unlockTime, "Still locked");
         
         lock.withdrawn = true;
+        lock.lockOwner = address(0);
         totalActiveNFTLocks = totalActiveNFTLocks > 0 ? totalActiveNFTLocks - 1 : 0;
         
         removeNFTFromUserList(msg.sender, nftContract, tokenId);

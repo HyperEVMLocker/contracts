@@ -1,0 +1,207 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract V2LOCK {
+    address public owner;
+    
+    struct LockInfo {
+        uint256 amount;
+        uint256 unlockTime;
+        uint256 lockTime;
+        bool withdrawn;
+    }
+    
+    mapping(address => mapping(address => LockInfo)) public locks;
+    
+    mapping(address => address[]) public userLockedTokens;
+    mapping(address => mapping(address => uint256)) private userLockedTokensIndex;
+    
+    uint256 public totalActiveTokenLocks;
+    uint256 public totalValueLocked;
+    
+    uint256 public lockFee = 1 ether;
+    
+    uint256 private _locked;
+    
+    struct RecentLock {
+        address token;
+        address lockOwner;
+        uint256 amount;
+        uint256 lockTime;
+        uint256 unlockTime;
+        bool withdrawn;
+    }
+    
+    RecentLock[10] public recentTokenLocks;
+    uint8 public recentTokenLockIndex = 0;
+    
+    event TokensLocked(address indexed token, address indexed owner, uint256 amount, uint256 unlockTime);
+    event TokensUnlocked(address indexed token, address indexed owner, uint256 amount);
+    event LockExtended(address indexed token, address indexed owner, uint256 newUnlockTime);
+    event LockFeeUpdated(uint256 oldFee, uint256 newFee);
+    
+    modifier nonReentrant() {
+        require(_locked == 0, "Reentrant call");
+        _locked = 1;
+        _;
+        _locked = 0;
+    }
+    
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
+    
+    constructor() {
+        owner = msg.sender;
+    }
+    
+    function transferFrom(address token, address from, address to, uint256 amount) private returns (bool) {
+        (bool success, bytes memory data) = token.call(
+            abi.encodeWithSelector(0x23b872dd, from, to, amount)
+        );
+        return success && (data.length == 0 || abi.decode(data, (bool)));
+    }
+    
+    function transfer(address token, address to, uint256 amount) private returns (bool) {
+        (bool success, bytes memory data) = token.call(
+            abi.encodeWithSelector(0xa9059cbb, to, amount)
+        );
+        return success && (data.length == 0 || abi.decode(data, (bool)));
+    }
+    
+    function balanceOf(address token, address account) private view returns (uint256) {
+        (bool success, bytes memory data) = token.staticcall(
+            abi.encodeWithSelector(0x70a08231, account)
+        );
+        return success ? abi.decode(data, (uint256)) : 0;
+    }
+    
+    function isContract(address addr) private view returns (bool) {
+        uint256 size;
+        assembly { size := extcodesize(addr) }
+        return size > 0;
+    }
+    
+    function addRecentLock(address token, address lockOwner, uint256 amount, uint256 lockTime, uint256 unlockTime) private {
+        recentTokenLocks[recentTokenLockIndex] = RecentLock(token, lockOwner, amount, lockTime, unlockTime, false);
+        recentTokenLockIndex = (recentTokenLockIndex + 1) % 10;
+    }
+    
+    function removeTokenFromUserList(address user, address token) private {
+        uint256 index = userLockedTokensIndex[user][token];
+        uint256 lastIndex = userLockedTokens[user].length - 1;
+        
+        if (index != lastIndex) {
+            address lastToken = userLockedTokens[user][lastIndex];
+            userLockedTokens[user][index] = lastToken;
+            userLockedTokensIndex[user][lastToken] = index;
+        }
+        
+        userLockedTokens[user].pop();
+        delete userLockedTokensIndex[user][token];
+    }
+    
+    function setLockFee(uint256 newFee) external onlyOwner {
+        require(newFee > 0, "Fee must be > 0");
+        uint256 oldFee = lockFee;
+        lockFee = newFee;
+        emit LockFeeUpdated(oldFee, newFee);
+    }
+    
+    function lockTokens(address token, uint256 amount, uint256 lockTime) external payable nonReentrant {
+        require(amount > 0, "Amount must be > 0");
+        require(lockTime > 0, "Lock time must be > 0");
+        require(msg.value == lockFee, "Incorrect fee amount"); 
+
+        uint256 balanceBefore = balanceOf(token, address(this));
+        require(transferFrom(token, msg.sender, address(this), amount), "Transfer failed");
+        uint256 balanceAfter = balanceOf(token, address(this));
+        uint256 received = balanceAfter - balanceBefore;
+        require(received > 0, "No tokens received");
+
+        uint256 unlockTime = block.timestamp + lockTime;
+
+        if (locks[token][msg.sender].amount == 0 || locks[token][msg.sender].withdrawn) {
+            locks[token][msg.sender] = LockInfo(received, unlockTime, block.timestamp, false);
+            userLockedTokensIndex[msg.sender][token] = userLockedTokens[msg.sender].length;
+            userLockedTokens[msg.sender].push(token);
+            totalActiveTokenLocks++;
+        } else {
+            locks[token][msg.sender].amount += received;
+            if (unlockTime > locks[token][msg.sender].unlockTime) {
+                locks[token][msg.sender].unlockTime = unlockTime;
+            }
+            locks[token][msg.sender].lockTime = block.timestamp;
+        }
+        
+        require(totalValueLocked + received >= totalValueLocked, "Value overflow");
+        totalValueLocked += received;
+
+        addRecentLock(token, msg.sender, received, block.timestamp, unlockTime);
+
+        emit TokensLocked(token, msg.sender, received, unlockTime);
+    }
+    
+    function getUserTokens(address user) external view returns (address[] memory) {
+        return userLockedTokens[user];
+    }
+
+    function unlockTokens(address token) external nonReentrant {
+        LockInfo storage lock = locks[token][msg.sender];
+        require(lock.amount > 0, "No tokens locked");
+        require(!lock.withdrawn, "Already withdrawn");
+        require(block.timestamp >= lock.unlockTime, "Still locked");
+        
+        uint256 amount = lock.amount;
+        lock.withdrawn = true;
+        totalActiveTokenLocks = totalActiveTokenLocks > 0 ? totalActiveTokenLocks - 1 : 0;
+        totalValueLocked = totalValueLocked >= amount ? totalValueLocked - amount : 0;
+        
+        removeTokenFromUserList(msg.sender, token);
+        
+        for (uint8 i = 0; i < 10; i++) {
+            if (recentTokenLocks[i].token == token && 
+                recentTokenLocks[i].lockOwner == msg.sender && 
+                !recentTokenLocks[i].withdrawn) {
+                recentTokenLocks[i].withdrawn = true;
+                break;
+            }
+        }
+        
+        require(transfer(token, msg.sender, amount), "Transfer failed");
+        emit TokensUnlocked(token, msg.sender, amount);
+    }
+    
+    function extendLock(address token, uint256 additionalTime) external nonReentrant {
+        require(additionalTime > 0, "Additional time must be > 0");
+        LockInfo storage lock = locks[token][msg.sender];
+        require(lock.amount > 0, "No tokens locked");
+        require(!lock.withdrawn, "Already withdrawn");
+        
+        uint256 newUnlockTime = lock.unlockTime + additionalTime;
+        lock.unlockTime = newUnlockTime;
+        
+        for (uint8 i = 0; i < 10; i++) {
+            if (recentTokenLocks[i].token == token && 
+                recentTokenLocks[i].lockOwner == msg.sender && 
+                !recentTokenLocks[i].withdrawn) {
+                recentTokenLocks[i].unlockTime = newUnlockTime;
+                break;
+            }
+        }
+        
+        emit LockExtended(token, msg.sender, newUnlockTime);
+    }
+    
+    function rescueETH() external onlyOwner {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No ETH to rescue");
+        
+        (bool success, ) = payable(owner).call{value: balance}("");
+        require(success, "ETH transfer failed");
+    }
+    
+    
+    receive() external payable {}
+}

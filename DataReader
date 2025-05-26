@@ -1,0 +1,190 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+interface IV2LOCK {
+    struct LockInfo {
+        uint256 amount;
+        uint256 unlockTime;
+        uint256 lockTime;
+        bool withdrawn;
+    }
+    function locks(address token, address user) external view returns (LockInfo memory);
+    function totalActiveTokenLocks() external view returns (uint256);
+    function totalValueLocked() external view returns (uint256);
+    function recentTokenLocks(uint256 index) external view returns (address token, address lockOwner, uint256 amount, uint256 lockTime, uint256 unlockTime, bool withdrawn);
+    function userLockedTokens(address user) external view returns (address[] memory);
+    
+    function getUserTokens(address user) external view returns (address[] memory);
+}
+
+interface IV3LOCK {
+    struct NFTLock {
+        uint256 unlockTime;
+        uint256 lockTime;
+        address lockOwner;
+        bool withdrawn;
+    }
+    struct NFTLockInfo {
+        address nftContract;
+        uint256 tokenId;
+    }
+    function nftLocks(address nftContract, uint256 tokenId) external view returns (NFTLock memory);
+    function totalActiveNFTLocks() external view returns (uint256);
+    function userLockedNFTs(address user) external view returns (NFTLockInfo[] memory);
+    
+    function getUserNFTs(address user) external view returns (NFTLockInfo[] memory);
+    
+    function getRecentNFTLock(uint256 index) external view returns (address nftContract, uint256 tokenId, address lockOwner, uint256 lockTime, uint256 unlockTime, bool withdrawn);
+}
+
+contract LockDataReader {
+    IV2LOCK public tokenLocker;
+    IV3LOCK public nftLocker;
+    
+    constructor(address _tokenLocker, address _nftLocker) {
+        tokenLocker = IV2LOCK(_tokenLocker);
+        nftLocker = IV3LOCK(_nftLocker);
+    }
+    
+    function getUserLockedTokens(address user) external view returns (
+        address[] memory tokens,
+        uint256[] memory amounts,
+        uint256[] memory lockTimes,
+        uint256[] memory unlockTimes,
+        bool[] memory withdrawnStates
+    ) {
+        address[] memory userTokens = tokenLocker.getUserTokens(user);
+        uint256 length = userTokens.length;
+        
+        tokens = new address[](length);
+        amounts = new uint256[](length);
+        lockTimes = new uint256[](length);
+        unlockTimes = new uint256[](length);
+        withdrawnStates = new bool[](length);
+        
+        for (uint256 i = 0; i < length; i++) {
+            address token = userTokens[i];
+            IV2LOCK.LockInfo memory lock = tokenLocker.locks(token, user);
+            tokens[i] = token;
+            amounts[i] = lock.amount;
+            lockTimes[i] = lock.lockTime;
+            unlockTimes[i] = lock.unlockTime;
+            withdrawnStates[i] = lock.withdrawn;
+        }
+        
+        return (tokens, amounts, lockTimes, unlockTimes, withdrawnStates);
+    }
+
+    function getUserLockedNFTs(address user) external view returns (
+        address[] memory nftContracts,
+        uint256[] memory tokenIds,
+        uint256[] memory lockTimes,
+        uint256[] memory unlockTimes,
+        bool[] memory withdrawnStates
+    ) {
+        IV3LOCK.NFTLockInfo[] memory userNFTs = nftLocker.getUserNFTs(user);
+        uint256 length = userNFTs.length;
+        
+        nftContracts = new address[](length);
+        tokenIds = new uint256[](length);
+        lockTimes = new uint256[](length);
+        unlockTimes = new uint256[](length);
+        withdrawnStates = new bool[](length);
+        
+        for (uint256 i = 0; i < length; i++) {
+            IV3LOCK.NFTLockInfo memory nftInfo = userNFTs[i];
+            IV3LOCK.NFTLock memory lock = nftLocker.nftLocks(nftInfo.nftContract, nftInfo.tokenId);
+            nftContracts[i] = nftInfo.nftContract;
+            tokenIds[i] = nftInfo.tokenId;
+            lockTimes[i] = lock.lockTime;
+            unlockTimes[i] = lock.unlockTime;
+            withdrawnStates[i] = lock.withdrawn;
+        }
+        
+        return (nftContracts, tokenIds, lockTimes, unlockTimes, withdrawnStates);
+    }
+    
+    function getTokenLockDetails(address token, address user) external view returns (
+        uint256 amount,
+        uint256 lockTime,
+        uint256 unlockTime,
+        bool withdrawn
+    ) {
+        IV2LOCK.LockInfo memory lock = tokenLocker.locks(token, user);
+        return (lock.amount, lock.lockTime, lock.unlockTime, lock.withdrawn);
+    }
+    
+    function getNFTLockDetails(address nftContract, uint256 tokenId) external view returns (
+        address lockOwner,
+        uint256 lockTime,
+        uint256 unlockTime,
+        bool withdrawn
+    ) {
+        IV3LOCK.NFTLock memory lock = nftLocker.nftLocks(nftContract, tokenId);
+        return (lock.lockOwner, lock.lockTime, lock.unlockTime, lock.withdrawn);
+    }
+    
+    function getTotalActiveLocks() external view returns (uint256) {
+        return tokenLocker.totalActiveTokenLocks() + nftLocker.totalActiveNFTLocks();
+    }
+    
+    function getRecentTokenLocks() external view returns (
+        address[] memory tokens,
+        address[] memory owners,
+        uint256[] memory amounts,
+        uint256[] memory lockTimes,
+        uint256[] memory unlockTimes,
+        bool[] memory withdrawnStates
+    ) {
+        tokens = new address[](10);
+        owners = new address[](10);
+        amounts = new uint256[](10);
+        lockTimes = new uint256[](10);
+        unlockTimes = new uint256[](10);
+        withdrawnStates = new bool[](10);
+        
+        for (uint256 i = 0; i < 10; i++) {
+            (tokens[i], owners[i], amounts[i], lockTimes[i], unlockTimes[i], withdrawnStates[i]) = tokenLocker.recentTokenLocks(i);
+        }
+        
+        return (tokens, owners, amounts, lockTimes, unlockTimes, withdrawnStates);
+    }
+    
+    function getRecentNFTLocks() external view returns (
+        address[] memory nftContracts,
+        uint256[] memory tokenIds,
+        address[] memory owners,
+        uint256[] memory lockTimes,
+        uint256[] memory unlockTimes,
+        bool[] memory withdrawnStates
+    ) {
+        nftContracts = new address[](10);
+        tokenIds = new uint256[](10);
+        owners = new address[](10);
+        lockTimes = new uint256[](10);
+        unlockTimes = new uint256[](10);
+        withdrawnStates = new bool[](10);
+        
+        for (uint256 i = 0; i < 10; i++) {
+            (nftContracts[i], tokenIds[i], owners[i], lockTimes[i], unlockTimes[i], withdrawnStates[i]) = nftLocker.getRecentNFTLock(i);
+        }
+        
+        return (nftContracts, tokenIds, owners, lockTimes, unlockTimes, withdrawnStates);
+    }
+    
+    function getTokenRemainingLockTime(address token, address user) external view returns (uint256) {
+        IV2LOCK.LockInfo memory lock = tokenLocker.locks(token, user);
+        if (lock.amount == 0 || lock.withdrawn || block.timestamp >= lock.unlockTime) {
+            return 0;
+        }
+        return lock.unlockTime - block.timestamp;
+    }
+    
+    function getNFTRemainingLockTime(address nftContract, uint256 tokenId) external view returns (uint256) {
+        IV3LOCK.NFTLock memory lock = nftLocker.nftLocks(nftContract, tokenId);
+        if (lock.lockOwner == address(0) || lock.withdrawn || block.timestamp >= lock.unlockTime) {
+            return 0;
+        }
+        return lock.unlockTime - block.timestamp;
+    }
+}

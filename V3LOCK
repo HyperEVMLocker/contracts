@@ -1,0 +1,214 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+contract V3LOCK {
+    address public owner;
+    
+    struct NFTLock {
+        uint256 unlockTime;
+        uint256 lockTime;
+        address lockOwner;
+        bool withdrawn;
+    }
+    
+    struct NFTLockInfo {
+        address nftContract;
+        uint256 tokenId;
+    }
+    
+    mapping(address => mapping(uint256 => NFTLock)) public nftLocks;
+    
+    mapping(address => NFTLockInfo[]) public userLockedNFTs;
+    mapping(address => mapping(address => mapping(uint256 => uint256))) private userNFTLocksIndex;
+    
+    struct RecentLockCircular {
+        NFTLockInfo[20] locks;
+        uint256 index;
+        uint256 count;
+    }
+    
+    RecentLockCircular private recentLocksData;
+    uint256 public lockFee = 1 ether;
+
+    uint256 public totalActiveNFTLocks;
+    
+    uint256 private _locked;
+    
+    event NFTLocked(address indexed nftContract, uint256 indexed tokenId, address indexed owner, uint256 unlockTime);
+    event NFTUnlocked(address indexed nftContract, uint256 indexed tokenId, address indexed owner);
+    event LockFeeUpdated(uint256 oldFee, uint256 newFee);
+    
+    modifier nonReentrant() {
+        require(_locked == 0, "Reentrant call");
+        _locked = 1;
+        _;
+        _locked = 0;
+    }
+    
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
+    
+    constructor() {
+        owner = msg.sender;
+    }
+    
+    function ownerOf(address nft, uint256 tokenId) private view returns (address) {
+        (bool success, bytes memory data) = nft.staticcall(
+            abi.encodeWithSelector(0x6352211e, tokenId)
+        );
+        require(success, "Failed to get owner");
+        return abi.decode(data, (address));
+    }
+    
+    function isApprovedOrOwner(address nft, address spender, uint256 tokenId) private view returns (bool) {
+    address nftOwner = ownerOf(nft, tokenId); 
+    if (spender == nftOwner) return true;
+        
+        (bool approvedSuccess, bytes memory approvedData) = nft.staticcall(
+            abi.encodeWithSelector(0x081812fc, tokenId) 
+        );
+        if (approvedSuccess && abi.decode(approvedData, (address)) == spender) {
+            return true;
+        }
+        
+        (bool approvedForAllSuccess, bytes memory approvedForAllData) = nft.staticcall(
+            abi.encodeWithSelector(0xe985e9c5, nftOwner, spender)
+        );
+        return approvedForAllSuccess && abi.decode(approvedForAllData, (bool));
+    }
+    
+    function transferNFT(address nft, address from, address to, uint256 tokenId) private {
+        require(ownerOf(nft, tokenId) == from, "Not token owner");
+        
+        (bool success,) = nft.call(
+            abi.encodeWithSelector(0x23b872dd, from, to, tokenId) // transferFrom
+        );
+        require(success, "NFT transfer failed");
+    }
+    
+    function _addToRecentLocks(address nftContract, uint256 tokenId) internal {
+        recentLocksData.locks[recentLocksData.index] = NFTLockInfo(nftContract, tokenId);
+        recentLocksData.index = (recentLocksData.index + 1) % 20;
+        if (recentLocksData.count < 20) {
+            recentLocksData.count++;
+        }
+    }
+    
+    function removeNFTFromUserList(address user, address nftContract, uint256 tokenId) private {
+        uint256 index = userNFTLocksIndex[user][nftContract][tokenId];
+        uint256 lastIndex = userLockedNFTs[user].length - 1;
+        
+        if (index != lastIndex) {
+            NFTLockInfo memory lastNFT = userLockedNFTs[user][lastIndex];
+            userLockedNFTs[user][index] = lastNFT;
+            userNFTLocksIndex[user][lastNFT.nftContract][lastNFT.tokenId] = index;
+        }
+        
+        userLockedNFTs[user].pop();
+        delete userNFTLocksIndex[user][nftContract][tokenId];
+    }
+    
+    function getRecentNFTLock(uint256 index) external view returns (
+        address nftContract,
+        uint256 tokenId,
+        address lockOwner,
+        uint256 lockTime,
+        uint256 unlockTime,
+        bool withdrawn
+    ) {
+        if (index >= recentLocksData.count) {
+            return (address(0), 0, address(0), 0, 0, false);
+        }
+        
+        uint256 realIndex;
+        if (recentLocksData.count < 20) {
+            realIndex = recentLocksData.count - 1 - index;
+        } else {
+            realIndex = (recentLocksData.index + 20 - 1 - index) % 20;
+        }
+        
+        NFTLockInfo memory lockInfo = recentLocksData.locks[realIndex];
+        NFTLock memory lock = nftLocks[lockInfo.nftContract][lockInfo.tokenId];
+        
+        return (
+            lockInfo.nftContract,
+            lockInfo.tokenId,
+            lock.lockOwner,
+            lock.lockTime,
+            lock.unlockTime,
+            lock.withdrawn
+        );
+    }
+
+    function setLockFee(uint256 newFee) external onlyOwner {
+        require(newFee > 0, "Fee must be > 0");
+        uint256 oldFee = lockFee;
+        lockFee = newFee;
+        emit LockFeeUpdated(oldFee, newFee);
+    }
+
+    function lockNFT(address nftContract, uint256 tokenId, uint256 lockTime) external payable nonReentrant {
+        require(lockTime > 0, "Lock time must be > 0");
+        require(msg.value == lockFee, "Incorrect fee amount");
+        
+        require(ownerOf(nftContract, tokenId) == msg.sender, "Not the owner of this NFT");
+        require(isApprovedOrOwner(nftContract, address(this), tokenId), "Contract not approved to transfer NFT");
+        require(nftLocks[nftContract][tokenId].lockOwner == address(0), "NFT already locked");
+
+        transferNFT(nftContract, msg.sender, address(this), tokenId);
+
+        uint256 unlockTime = block.timestamp + lockTime;
+        nftLocks[nftContract][tokenId] = NFTLock(unlockTime, block.timestamp, msg.sender, false);
+
+        userNFTLocksIndex[msg.sender][nftContract][tokenId] = userLockedNFTs[msg.sender].length;
+        userLockedNFTs[msg.sender].push(NFTLockInfo(nftContract, tokenId));
+
+        _addToRecentLocks(nftContract, tokenId);
+        totalActiveNFTLocks++;
+
+        emit NFTLocked(nftContract, tokenId, msg.sender, unlockTime);
+    }
+    
+    function unlockNFT(address nftContract, uint256 tokenId) external nonReentrant {
+        NFTLock storage lock = nftLocks[nftContract][tokenId];
+        require(lock.lockOwner == msg.sender, "Not the owner");
+        require(!lock.withdrawn, "Already withdrawn");
+        require(block.timestamp >= lock.unlockTime, "Still locked");
+        
+        lock.withdrawn = true;
+        totalActiveNFTLocks = totalActiveNFTLocks > 0 ? totalActiveNFTLocks - 1 : 0;
+        
+        removeNFTFromUserList(msg.sender, nftContract, tokenId);
+        
+        transferNFT(nftContract, address(this), msg.sender, tokenId);
+        emit NFTUnlocked(nftContract, tokenId, msg.sender);
+    }
+    
+    function extendNFTLock(address nftContract, uint256 tokenId, uint256 additionalTime) external nonReentrant {
+        require(additionalTime > 0, "Additional time must be > 0");
+        NFTLock storage lock = nftLocks[nftContract][tokenId];
+        require(lock.lockOwner == msg.sender, "Not the owner");
+        require(!lock.withdrawn, "Already withdrawn");
+        
+        lock.unlockTime += additionalTime;
+        
+        emit NFTLocked(nftContract, tokenId, msg.sender, lock.unlockTime); 
+    }
+    
+    function getUserNFTs(address user) external view returns (NFTLockInfo[] memory) {
+        return userLockedNFTs[user];
+    }
+    
+    function rescueETH() external onlyOwner {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "No ETH to rescue");
+        
+        (bool success, ) = payable(owner).call{value: balance}("");
+        require(success, "ETH transfer failed");
+    }
+    
+    
+    receive() external payable {}
+}
